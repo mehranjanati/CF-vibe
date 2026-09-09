@@ -1,0 +1,496 @@
+import { type RefObject, type ReactNode, Suspense, useState, useCallback, useMemo } from 'react';
+import { WebSocket } from 'partysocket';
+import { MonacoEditor } from '../../../components/monaco-editor/lazy-monaco-editor';
+import { motion } from 'framer-motion';
+import { RefreshCw } from 'lucide-react';
+import { Blueprint } from './blueprint';
+import { FileExplorer } from './file-explorer';
+import { PreviewIframe } from './preview-iframe';
+import { PreviewCompatBanner } from './preview-compat-banner';
+import { PreviewPanel } from '../../../components/preview/PreviewPanel';
+import { MarkdownDocsPreview } from './markdown-docs-preview';
+import { WorkflowVisualizer } from '../../../components/workflow/WorkflowVisualizer';
+import { ViewContainer } from './view-container';
+import { ViewHeader } from './view-header';
+import { PreviewHeaderActions } from './preview-header-actions';
+import { EditorHeaderActions } from './editor-header-actions';
+import { Copy } from './copy';
+import { DatabaseViewer } from './database-viewer';
+import { featureRegistry } from '@/features';
+import type { FileType, BlueprintType, BehaviorType, ModelConfigsInfo, TemplateDetails, ProjectType } from '@/api-types';
+import type { ContentDetectionResult } from '../utils/content-detector';
+import type { GitHubExportHook } from '@/hooks/use-github-export';
+import type { Edit } from '../hooks/use-chat';
+
+interface MainContentPanelProps {
+	// View state
+	view: 'editor' | 'preview' | 'docs' | 'blueprint' | 'terminal' | 'presentation' | 'database' | 'workflow';
+	onViewChange: (mode: 'preview' | 'editor' | 'docs' | 'blueprint' | 'presentation' | 'database' | 'workflow') => void;
+
+	// Content detection
+	hasDocumentation: boolean;
+	contentDetection: ContentDetectionResult;
+
+	// Preview state
+	projectType: ProjectType;
+	previewUrl?: string;
+	/** Client-side VFS (WebSocket-accumulated) powering the Sandpack preview. */
+	vfsFiles: Record<string, string>;
+	/**
+	 * VFS snapshot hydrated from the control plane (GET /api/projects/:id/files)
+	 * when reopening a chat. Lowest merge precedence: live `vfsFiles` (WS)
+	 * and restored `allFiles` always win over this snapshot.
+	 */
+	hydratedFiles?: Record<string, string>;
+	previewAvailable: boolean;
+	showTooltip: boolean;
+	shouldRefreshPreview: boolean;
+	manualRefreshTrigger: number;
+	onManualRefresh: () => void;
+
+	// Blueprint
+	blueprint?: BlueprintType | null;
+
+	// Editor state
+	activeFile?: FileType;
+	allFiles: FileType[];
+	edit?: Edit | null;
+	onFileClick: (file: FileType) => void;
+
+	// Generation state
+	isGenerating: boolean;
+	isGeneratingBlueprint: boolean;
+
+	// Model configs
+	modelConfigs?: ModelConfigsInfo;
+	loadingConfigs: boolean;
+	onRequestConfigs: () => void;
+
+	// Git/GitHub actions
+	onGitCloneClick: () => void;
+	isGitHubExportReady: boolean;
+	githubExport: GitHubExportHook;
+
+	// Template metadata
+	templateDetails?: TemplateDetails | null;
+
+	// Other
+	behaviorType?: BehaviorType;
+	websocket?: WebSocket;
+
+	// DB tab (think-behavior only)
+	agentId?: string;
+	databaseAvailable: boolean;
+
+	// Refs
+	previewRef: RefObject<HTMLIFrameElement | null>;
+	editorRef: RefObject<HTMLDivElement | null>;
+}
+
+export function MainContentPanel(props: MainContentPanelProps) {
+	const {
+		view,
+		onViewChange,
+		hasDocumentation,
+		contentDetection,
+		projectType,
+		previewUrl,
+		vfsFiles,
+		hydratedFiles,
+		previewAvailable,
+		showTooltip,
+		shouldRefreshPreview,
+		manualRefreshTrigger,
+		onManualRefresh,
+		blueprint,
+		activeFile,
+		allFiles,
+		edit,
+		onFileClick,
+		isGenerating,
+		isGeneratingBlueprint,
+		modelConfigs,
+		loadingConfigs,
+		onRequestConfigs,
+		onGitCloneClick,
+		isGitHubExportReady,
+		githubExport,
+		behaviorType,
+		websocket,
+		previewRef,
+		editorRef,
+		templateDetails,
+		agentId,
+		databaseAvailable,
+	} = props;
+
+	// Feature-specific state management
+	const [featureState, setFeatureStateInternal] = useState<Record<string, unknown>>({});
+	const setFeatureState = useCallback((key: string, value: unknown) => {
+		setFeatureStateInternal(prev => ({ ...prev, [key]: value }));
+	}, []);
+
+	const workflowAvailable = useMemo(() => {
+		// workflow.json may arrive via the live VFS stream or via restored
+		// file lists (agent_connected / file_generated).
+		if (vfsFiles['workflow.json'] !== undefined) return true;
+		return allFiles.some((f) => f.filePath === 'workflow.json');
+	}, [vfsFiles, allFiles]);
+
+	const commonHeaderProps = {
+		view: view as 'preview' | 'editor' | 'docs' | 'blueprint' | 'presentation' | 'database' | 'workflow',
+		onViewChange,
+		previewAvailable,
+		showTooltip,
+		hasDocumentation,
+		previewUrl,
+		projectType,
+		databaseAvailable,
+		workflowAvailable,
+	};
+
+	const renderViewWithHeader = (
+		centerContent: ReactNode,
+		viewContent: ReactNode,
+		rightActions?: ReactNode,
+		headerOverrides?: Partial<typeof commonHeaderProps>
+	) => (
+		<ViewContainer>
+			<ViewHeader
+				{...commonHeaderProps}
+				{...headerOverrides}
+				centerContent={centerContent}
+				rightActions={rightActions}
+			/>
+			{viewContent}
+		</ViewContainer>
+	);
+
+	const renderDocsView = () => {
+		if (!hasDocumentation) return null;
+
+		const markdownFiles = Object.values(contentDetection.Contents)
+			.filter(bundle => bundle.type === 'markdown')
+			.flatMap(bundle => bundle.files);
+
+		if (markdownFiles.length === 0) return null;
+
+		return renderViewWithHeader(
+			<span className="text-sm font-mono text-text-50/70">Documentation</span>,
+			<MarkdownDocsPreview
+				files={markdownFiles}
+				isGenerating={isGenerating || isGeneratingBlueprint}
+			/>
+		);
+	};
+
+	const renderPreviewView = () => {
+		// No server-side preview URL → fall back to the client-side Sandpack
+		// (Nodebox) preview driven by the WebSocket-accumulated VFS. This is
+		// the primary preview path in the dual-plane (Go control plane) setup,
+		// where no Cloudflare sandbox/dispatcher preview URL is produced.
+		if (!previewUrl) {
+			// Client-side Sandpack (Nodebox) preview. Feed it from THREE
+			// sources, lowest precedence first: `hydratedFiles` (control-plane
+			// VFS snapshot fetched on chat reopen), `allFiles` (restored /
+			// agent_connected file lists) and `vfsFiles` (live WebSocket
+			// stream, always wins) — so previews also work when reopening an
+			// existing chat, not only while files stream in live.
+			const sandpackFiles: Record<string, string> = { ...hydratedFiles };
+			for (const f of allFiles) {
+				if (f.filePath && f.fileContents && sandpackFiles[f.filePath] === undefined) {
+					sandpackFiles[f.filePath] = f.fileContents;
+				}
+			}
+			for (const [filePath, contents] of Object.entries(vfsFiles)) {
+				sandpackFiles[filePath] = contents;
+			}
+			if (Object.keys(sandpackFiles).length === 0) {
+				return null;
+			}
+			return (
+				<div className="flex-1 min-h-0 flex flex-col">
+					<PreviewPanel
+						files={sandpackFiles}
+						template="node"
+						className="flex-1 min-h-0"
+					/>
+				</div>
+			);
+		}
+
+		// Get feature capabilities to determine preview behavior
+		const featureCapabilities = featureRegistry.getCapabilities(projectType);
+		const featureDefinition = featureRegistry.getDefinition(projectType);
+		const previewTitle = blueprint?.title ?? featureDefinition?.name ?? 'Preview';
+
+		// Check if we should show the refresh button (presentations handle refresh differently)
+		const showManualRefresh = featureCapabilities?.hasLiveReload ?? true;
+
+		// Get lazy-loaded preview component from feature registry
+		const FeaturePreviewComponent = featureRegistry.getLazyPreviewComponent(projectType);
+
+		// Fallback to default PreviewIframe if no feature-specific component
+		const previewContent = FeaturePreviewComponent ? (
+			<Suspense
+				fallback={
+					<div className="flex-1 w-full h-full flex items-center justify-center bg-kumo-base">
+						<RefreshCw className="size-6 text-kumo-brand animate-spin" />
+					</div>
+				}
+			>
+				<FeaturePreviewComponent
+					projectType={projectType}
+					behaviorType={behaviorType ?? 'phasic'}
+					previewUrl={previewUrl}
+					websocket={websocket}
+					files={allFiles}
+					activeFile={activeFile}
+					currentView={view}
+					onViewChange={(v) => onViewChange(v as 'preview' | 'editor' | 'docs' | 'blueprint' | 'presentation')}
+					templateDetails={templateDetails}
+					modelConfigs={modelConfigs}
+					blueprint={blueprint}
+					previewRef={previewRef}
+					editorRef={editorRef}
+					shouldRefreshPreview={shouldRefreshPreview}
+					manualRefreshTrigger={manualRefreshTrigger}
+					onManualRefresh={onManualRefresh}
+					featureState={featureState}
+					setFeatureState={setFeatureState}
+					className="flex-1 w-full h-full border-0"
+				/>
+			</Suspense>
+		) : (
+			<PreviewIframe
+				src={previewUrl}
+				ref={previewRef}
+				className="flex-1 w-full h-full border-0"
+				title="Preview"
+				shouldRefreshPreview={shouldRefreshPreview}
+				manualRefreshTrigger={manualRefreshTrigger}
+				webSocket={websocket}
+			/>
+		);
+
+		// Get lazy-loaded header actions component from feature registry
+		const FeatureHeaderActionsComponent = featureRegistry.getLazyHeaderActionsComponent(projectType);
+
+		// Fallback to PreviewHeaderActions if no feature-specific component
+		const headerActions = FeatureHeaderActionsComponent ? (
+			<Suspense fallback={null}>
+				<FeatureHeaderActionsComponent
+					projectType={projectType}
+					behaviorType={behaviorType ?? 'phasic'}
+					previewUrl={previewUrl}
+					websocket={websocket}
+					files={allFiles}
+					activeFile={activeFile}
+					currentView={view}
+					onViewChange={(v) => onViewChange(v as 'preview' | 'editor' | 'docs' | 'blueprint' | 'presentation')}
+					templateDetails={templateDetails}
+					modelConfigs={modelConfigs}
+					blueprint={blueprint}
+					previewRef={previewRef}
+					editorRef={editorRef}
+					shouldRefreshPreview={shouldRefreshPreview}
+					manualRefreshTrigger={manualRefreshTrigger}
+					onManualRefresh={onManualRefresh}
+					featureState={featureState}
+					setFeatureState={setFeatureState}
+					onGitCloneClick={onGitCloneClick}
+					isGitHubExportReady={isGitHubExportReady}
+					onGitHubExportClick={githubExport.openModal}
+					loadingConfigs={loadingConfigs}
+					onRequestConfigs={onRequestConfigs}
+				/>
+			</Suspense>
+		) : (
+			<PreviewHeaderActions
+				modelConfigs={modelConfigs}
+				onRequestConfigs={onRequestConfigs}
+				loadingConfigs={loadingConfigs}
+				onGitCloneClick={onGitCloneClick}
+				isGitHubExportReady={isGitHubExportReady}
+				onGitHubExportClick={githubExport.openModal}
+				previewRef={previewRef}
+			/>
+		);
+
+		return renderViewWithHeader(
+			<div className="flex min-w-0 items-center gap-2">
+				<span
+					className="truncate text-sm font-mono text-text-50/70"
+					title={previewTitle}
+				>
+					{previewTitle}
+				</span>
+				<span className="shrink-0">
+					<Copy text={previewUrl} />
+				</span>
+				{showManualRefresh && (
+					<button
+						className="shrink-0 p-1 hover:bg-kumo-elevated rounded transition-colors"
+						onClick={onManualRefresh}
+						title="Refresh preview"
+					>
+						<RefreshCw className="size-4 text-text-primary/50" />
+					</button>
+				)}
+			</div>,
+			<div className="flex flex-1 min-h-0 flex-col">
+				<PreviewCompatBanner previewUrl={previewUrl} />
+				<div className="relative flex flex-1 min-h-0 flex-col">{previewContent}</div>
+			</div>,
+			headerActions
+		);
+	};
+
+	const renderBlueprintView = () =>
+		renderViewWithHeader(
+			<div className="flex items-center gap-2">
+				<span className="text-sm text-text-50/70 font-mono">Blueprint.md</span>
+				{previewUrl && <Copy text={previewUrl} />}
+			</div>,
+			<div className="flex-1 overflow-y-auto bg-kumo-base">
+				<div className="py-12 mx-auto">
+					<Blueprint
+						blueprint={blueprint ?? ({} as BlueprintType)}
+						className="w-full max-w-2xl mx-auto"
+					/>
+				</div>
+			</div>
+		);
+
+	const renderEditorView = () => {
+		// Defensive fallback: show file explorer with empty editor if no activeFile
+		if (!activeFile) {
+			return renderViewWithHeader(
+				<div className="flex items-center gap-2">
+					<span className="text-sm font-mono text-text-50/70">Select a file</span>
+				</div>,
+				<div className="flex-1 relative">
+					<div className="absolute inset-0 flex" ref={editorRef}>
+						<FileExplorer
+							files={allFiles}
+							currentFile={undefined}
+							onFileClick={onFileClick}
+						/>
+						<div className="flex-1 flex items-center justify-center bg-kumo-base">
+							<span className="text-text-50/50 text-sm">No file selected</span>
+						</div>
+					</div>
+				</div>,
+				<EditorHeaderActions
+					modelConfigs={modelConfigs}
+					onRequestConfigs={onRequestConfigs}
+					loadingConfigs={loadingConfigs}
+					onGitCloneClick={onGitCloneClick}
+					isGitHubExportReady={isGitHubExportReady}
+					onGitHubExportClick={githubExport.openModal}
+					editorRef={editorRef}
+				/>
+			);
+		}
+
+		return renderViewWithHeader(
+			<div className="flex items-center gap-2">
+				<span className="text-sm font-mono text-text-50/70">{activeFile.filePath}</span>
+				{previewUrl && <Copy text={previewUrl} />}
+			</div>,
+			<div className="flex-1 relative">
+				<div className="absolute inset-0 flex" ref={editorRef}>
+					<FileExplorer
+						files={allFiles}
+						currentFile={activeFile}
+						onFileClick={onFileClick}
+					/>
+					<div className="flex-1">
+						<MonacoEditor
+							className="h-full"
+							path={activeFile.filePath}
+							stickToBottom={!!activeFile.isGenerating}
+							createOptions={{
+								value: activeFile.fileContents || '',
+								language: activeFile.language || 'plaintext',
+								readOnly: true,
+								minimap: { enabled: false },
+								lineNumbers: 'on',
+								scrollBeyondLastLine: false,
+								fontSize: 13,
+								automaticLayout: true,
+							}}
+							find={edit?.filePath === activeFile.filePath ? edit.search : undefined}
+							replace={edit?.filePath === activeFile.filePath ? edit.replacement : undefined}
+						/>
+					</div>
+				</div>
+			</div>,
+			<EditorHeaderActions
+				modelConfigs={modelConfigs}
+				onRequestConfigs={onRequestConfigs}
+				loadingConfigs={loadingConfigs}
+				onGitCloneClick={onGitCloneClick}
+				isGitHubExportReady={isGitHubExportReady}
+				onGitHubExportClick={githubExport.openModal}
+				editorRef={editorRef}
+			/>
+		);
+	};
+
+	const renderDatabaseView = () => {
+		if (!databaseAvailable || !agentId) return null;
+		return renderViewWithHeader(
+			<div className="flex items-center gap-2">
+				<span className="text-sm font-mono text-text-50/70">Database</span>
+			</div>,
+			<DatabaseViewer agentId={agentId} enabled={view === 'database'} />,
+		);
+	};
+
+	const renderWorkflowView = () => {
+		if (!workflowAvailable) return null;
+		// Same merge logic as the preview: live VFS stream + restored files.
+		const mergedFiles: Record<string, string> = { ...vfsFiles };
+		for (const f of allFiles) {
+			if (f.filePath && f.fileContents && mergedFiles[f.filePath] === undefined) {
+				mergedFiles[f.filePath] = f.fileContents;
+			}
+		}
+		return renderViewWithHeader(
+			<span className="text-sm font-mono text-text-50/70">Backend Logic</span>,
+			<WorkflowVisualizer files={mergedFiles} className="flex-1 min-h-0" />,
+		);
+	};
+
+	const renderView = () => {
+		switch (view) {
+			case 'docs':
+				return renderDocsView();
+			case 'preview':
+			case 'presentation': // Presentations now use preview view
+				return renderPreviewView();
+			case 'blueprint':
+				return renderBlueprintView();
+			case 'editor':
+				return renderEditorView();
+			case 'database':
+				return renderDatabaseView();
+			case 'workflow':
+				return renderWorkflowView();
+			default:
+				return null;
+		}
+	};
+
+	return (
+		<motion.div
+			className="flex-1 flex flex-col overflow-hidden"
+			initial={{ opacity: 0, scale: 0.84 }}
+			animate={{ opacity: 1, scale: 1 }}
+			transition={{ duration: 0.3, ease: 'easeInOut' }}
+		>
+			{renderView()}
+		</motion.div>
+	);
+}
